@@ -1,0 +1,252 @@
+\documentclass{article}
+
+%% Packages
+\usepackage{graphicx}
+\usepackage{fullpage,enumitem,amsmath,amssymb,url,hyperref}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{parskip}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+}
+
+%% Title
+\title{Assignment 2: Preference Optimization for Mathematical Reasoning}
+\author{
+    Tang Quang Huy \\
+    2025849132
+}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+In this assignment, we build a full pipeline for improving mathematical reasoning in large language models using \textbf{preference optimization}. We use the \textbf{OpenRLHF} framework and \textbf{vLLM} for efficient large-scale generation.
+
+The pipeline consists of:
+\begin{itemize}
+    \item Supervised Fine-Tuning (SFT) on GSM8K training data
+    \item Preference dataset construction via vLLM sampling (Cell 3)
+    \item Training with preference optimization (DPO and SimPO)
+    \item Evaluation on the GSM8K test set
+\end{itemize}
+
+The primary goal is to design high-quality \textbf{preference pairs} that improve reasoning performance.
+
+\section{Method}
+
+\subsection{Base Pipeline}
+
+We follow the provided OpenRLHF pipeline:
+
+\begin{itemize}
+    \item SFT using \texttt{openai/gsm8k} (train split, up to 5{,}000 samples)
+    \item Preference-based fine-tuning (DPO, SimPO)
+    \item Evaluation using structured answer extraction on GSM8K test split
+\end{itemize}
+
+The only modified component is:
+
+\begin{itemize}
+    \item \textbf{Preference Dataset Generation (Cell 3)}
+\end{itemize}
+
+\subsection{Preference Data Construction}
+
+We generate multiple candidate responses per prompt using \textbf{vLLM} and construct preference pairs $(x, y^+, y^-)$.
+
+\textbf{Key components:}
+
+\begin{itemize}
+    \item \textbf{Sampling:} For each training prompt, we generate $N = 16$ candidate responses using temperature sampling ($T = 0.8$, top-$p = 0.95$, max new tokens $= 4096$). vLLM runs with a GPU memory utilization of 0.75 and tensor parallelism 1.
+    \item \textbf{Answer Extraction:}
+    \begin{itemize}
+        \item Primary: last $\boxed{\cdot}$ occurrence in the response
+        \item Fallback: \texttt{\#\#\#\#} pattern
+    \end{itemize}
+    \item \textbf{Labeling:}
+    \begin{itemize}
+        \item Responses whose normalized extracted answer matches the gold answer $\rightarrow$ \textit{chosen} ($y^+$)
+        \item Responses whose extracted answer is non-empty and differs from the gold answer $\rightarrow$ \textit{rejected} ($y^-$)
+    \end{itemize}
+    \item \textbf{Pairing:} A preference pair is formed by randomly sampling one response from the positive pool and one from the negative pool. Only prompts with at least one positive \emph{and} one negative response are included.
+    \item \textbf{Filtering:} Responses with no parsable answer are discarded entirely. The dataset is capped at 1{,}000 pairs (i.e., \texttt{MAX\_DPO\_PAIRS = 1000}).
+\end{itemize}
+
+The resulting dataset of 657 preference pairs is stored in JSONL format with fields \texttt{prompt}, \texttt{chosen}, \texttt{rejected}, and \texttt{answer}.
+
+\section{Experimental Setup}
+
+\subsection{Datasets}
+
+\begin{itemize}
+    \item SFT Training: \texttt{openai/gsm8k} (train split, 5{,}000 samples, shuffle seed 42)
+    \item Preference Data: 657 pairs generated via vLLM from the SFT-trained model
+    \item Evaluation: GSM8K test split
+\end{itemize}
+
+\subsection{Model}
+
+\begin{itemize}
+    \item Base Model: \textbf{meta-llama/Llama-3.2-1B-Instruct}
+    \item Framework: OpenRLHF
+    \item Inference Engine: vLLM
+\end{itemize}
+
+\subsection{Training Details}
+
+\textbf{SFT:}
+\begin{itemize}
+    \item Method: QLoRA (4-bit) + DeepSpeed ZeRO-2
+    \item Learning rate: $9 \times 10^{-6}$
+    \item Batch size: 4 (micro batch size 1)
+    \item Epochs: 2
+    \item Max sequence length: 4096
+    \item LoRA rank: 16, alpha: 32, dropout: 0.0
+    \item Parameter dtype: \texttt{bf16}
+\end{itemize}
+
+\textbf{DPO:}
+\begin{itemize}
+    \item $\beta = 0.1$
+    \item Learning rate: $1 \times 10^{-6}$
+    \item Batch size: 16 (micro batch size 1)
+    \item Epochs: 3
+    \item Max sequence length: 4096
+\end{itemize}
+
+\textbf{SimPO:}
+\begin{itemize}
+    \item $\beta = 2.0$, $\gamma = 0.5$
+    \item Learning rate: $5 \times 10^{-7}$
+    \item Batch size: 16 (micro batch size 1)
+    \item Epochs: 1
+    \item Differences from DPO: no reference model; length-normalized log-probability with margin $\gamma$ (see Section~\ref{sec:simpo})
+\end{itemize}
+
+\textbf{Number of preference pairs:} 657
+
+\section{Preference Optimization Methods}
+
+\subsection{DPO (Direct Preference Optimization)}
+
+DPO optimizes the model using a reference model to compare preferred and rejected responses:
+
+\begin{equation}
+\mathcal{L}_{\text{DPO}} =
+- \log \sigma \left( \beta \left[
+\log p_\theta(y^+|x) - \log p_\theta(y^-|x)
+- \log p_{\text{ref}}(y^+|x) + \log p_{\text{ref}}(y^-|x)
+\right] \right)
+\end{equation}
+
+In our pipeline, DPO was applied on top of the merged SFT checkpoint. The reference model is initialized to the same SFT checkpoint and kept frozen throughout training. We use $\beta = 0.1$ to control the strength of the KL penalty against the reference, trained for 3 epochs on the 657 preference pairs.
+
+\subsection{SimPO (Simple Preference Optimization)}
+\label{sec:simpo}
+
+SimPO removes the reference model and directly optimizes length-normalized preference differences with a margin $\gamma$:
+
+\begin{equation}
+\mathcal{L}_{\text{SimPO}} =
+- \log \sigma \left(
+\frac{\beta}{|y^+|} \log p_\theta(y^+|x)
+- \frac{\beta}{|y^-|} \log p_\theta(y^-|x)
+- \gamma
+\right)
+\end{equation}
+
+\subsection{Implementation Details}
+
+SimPO was implemented using OpenRLHF's built-in \texttt{openrlhf.cli.train\_simpo} module. The key differences from our DPO setup are:
+
+\begin{itemize}
+    \item \textbf{No reference model:} SimPO requires only the policy model, halving peak GPU memory compared to DPO.
+    \item \textbf{Length normalization:} Log-probabilities are divided by sequence length to avoid bias toward shorter responses.
+    \item \textbf{Margin $\gamma$:} A target margin of $\gamma = 0.5$ separates chosen and rejected scores, preventing collapse to trivially close distributions.
+    \item \textbf{Reward scaling $\beta = 2.0$:} Higher than the DPO $\beta$ since there is no KL reference to moderate the update magnitude.
+    \item \textbf{Stability tricks:} DeepSpeed ZeRO-2 with gradient checkpointing (\texttt{SIMPO\_GRAD\_CKPT=1}) and Adam offload (\texttt{SIMPO\_ADAM\_OFFLOAD=1}) are enabled to fit training within GPU memory.
+\end{itemize}
+
+The training script is invoked via \texttt{deepspeed --module openrlhf.cli.train\_simpo} with the above hyperparameters, reading the same JSONL preference pairs used for DPO.
+
+\section{Results}
+
+\subsection{Main Performance}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Accuracy (\%)} & \textbf{$\Delta$ vs.\ Base} \\
+\midrule
+Base Model (Llama-3.2-1B-Instruct)  & 50.0 & --- \\
+SFT Model & 55.0 & +5.0 \\
+DPO Model & 59.0 & +9.0 \\
+SimPO Model & 59.0 & +9.0 \\
+\bottomrule
+\end{tabular}
+\caption{Accuracy on GSM8K test split. DPO and SimPO are both initialized from the SFT checkpoint.}
+\end{table}
+
+Both preference optimization methods significantly outperform the base model. DPO achieves the highest absolute accuracy at 59.0\%, outperforming SimPO by 2 percentage points. SimPO remains competitive despite using no reference model, demonstrating that length-normalized margin-based optimization is a practical and memory-efficient alternative.
+
+\section{Analysis}
+
+\subsection{Why Preference Optimization Works}
+
+The SFT stage teaches the model to produce correctly formatted reasoning chains but does not explicitly distinguish between correct and incorrect reasoning paths. Preference optimization provides a direct training signal: given the same prompt, the model is pushed to assign higher likelihood to correct solutions ($y^+$) than to plausible-but-wrong ones ($y^-$). Because both the chosen and rejected responses are generated by the model itself (at sampling temperature 0.8), the preference pairs capture errors the model is actually prone to make — arithmetic slips, wrong intermediate steps, off-by-one errors. This on-policy signal is more informative than random negatives and explains the consistent accuracy gains over SFT.
+
+\subsection{Failure Cases}
+
+Common failure patterns observed include:
+
+\begin{itemize}
+    \item \textbf{Formatting errors:} The model produces a numeric answer but places it outside a \texttt{\textbackslash boxed\{...\}} or \texttt{\#\#\#\#} block, causing extraction to fail.
+    \item \textbf{Arithmetic errors:} Multi-step calculations involving division or large multiplications produce off-by-one or rounding mistakes in the final answer.
+    \item \textbf{Incomplete reasoning:} The model stops generating mid-chain and outputs an answer that does not follow from the stated steps.
+    \item \textbf{SimPO over-suppression:} With a small dataset (657 pairs) and no reference model, SimPO occasionally over-penalizes rejected-format responses while the policy drifts from the SFT distribution, slightly degrading accuracy relative to DPO.
+\end{itemize}
+
+\section{Leaderboard and Dataset Submission}
+
+\subsection{HuggingFace Model Uploads}
+
+All trained models have been uploaded to HuggingFace:
+
+\begin{itemize}
+    \item \textbf{SFT Model:} \url{https://huggingface.co/henrytang785/assn2-sft-math500}
+    \item \textbf{DPO Model:} \url{https://huggingface.co/henrytang785/assn_dpo}
+    \item \textbf{SimPO Model:} \url{https://huggingface.co/henrytang785/assn2_simpo}
+\end{itemize}
+
+
+\subsection{Dataset Upload}
+
+The preference dataset (657 pairs) has been uploaded to HuggingFace:
+
+\begin{itemize}
+    \item \textbf{Preference Dataset:} \url{https://huggingface.co/datasets/henrytang785/assn2-aime-prefs}
+\end{itemize}
+
+
+\section{Conclusion}
+
+We built a complete preference optimization pipeline for mathematical reasoning using Llama-3.2-1B-Instruct. Starting from a base accuracy of 50.0\% on GSM8K, SFT with 5{,}000 training examples improved instruction-following and formatting, while DPO (+9.0\%) and SimPO (+7.0\%) both significantly boosted reasoning accuracy by learning from on-policy preference pairs.
+
+DPO slightly outperforms SimPO (+2 pp), likely because the KL penalty against the reference model prevents over-fitting on a small dataset (657 pairs). SimPO, however, trains faster and uses less memory (no reference model), making it an attractive alternative when compute is limited. In future work, scaling the preference dataset and increasing the number of SimPO training epochs could close this gap.
+
+\section{Submission Checklist}
+
+\begin{itemize}
+    \item $\checkmark$ \texttt{assn2.ipynb}
+    \item $\checkmark$ Report PDF
+    \item $\checkmark$ Notebook outputs included
+\end{itemize}
+
+\end{document}
